@@ -223,18 +223,23 @@ export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
-  // Step 1: Verify Resend webhook signature
+  // Step 1: Verify Resend webhook signature.
+  // resend.webhooks.verify() is synchronous — no await.
+  // Pass the raw request body string (req.text() in Next.js App Router;
+  // JSON.stringify(req.body) is NOT safe as JSON parsing alters whitespace).
+  // Header keys are renamed from the raw svix- prefix: svix-id → id,
+  // svix-timestamp → timestamp, svix-signature → signature.
   let event;
   try {
-    event = await resend.webhooks.constructEvent(
-      JSON.stringify(req.body),
-      {
-        'svix-id': req.headers['svix-id'] as string,
-        'svix-timestamp': req.headers['svix-timestamp'] as string,
-        'svix-signature': req.headers['svix-signature'] as string,
+    event = resend.webhooks.verify({
+      payload: JSON.stringify(req.body),
+      headers: {
+        id:        req.headers['svix-id']        as string,
+        timestamp: req.headers['svix-timestamp'] as string,
+        signature: req.headers['svix-signature'] as string,
       },
-      webhookSecret
-    );
+      webhookSecret,
+    });
   } catch {
     return res.status(400).json({ error: 'Invalid webhook signature' });
   }
@@ -255,7 +260,7 @@ export default async function handler(
     case 'email.bounced':
       // Hard bounce — suppress in both Anablock CRM and Resend
       await Promise.all([
-        anablockCrm.contacts.suppress(recipientEmail),   // mark undeliverable in CRM
+        anablockCrm.contacts.suppress(recipientEmail),
         resend.contacts.remove({ email: recipientEmail, audienceId: process.env.RESEND_AUDIENCE_ID! }),
       ]);
       break;
