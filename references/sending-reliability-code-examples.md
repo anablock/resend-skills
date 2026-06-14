@@ -1,15 +1,18 @@
 # Sending Reliability — Code Examples
 
-> These TypeScript examples are proposed additions to
-> `references/sending-reliability.md`.
+> TypeScript examples for Anablock's three primary email surfaces:
+> **Anablock CRM** (outreach sequences), **Anablock Echo** (AI-triggered
+> communications), and **Sterolux** (e-commerce transactional + marketing).
+> Proposed additions to `references/sending-reliability.md`.
 
 ---
 
-## Idempotency Key — Deterministic Generation
+## 1. Idempotency Keys — Anablock Patterns
 
-Generate a stable key tied to the logical event, not the request attempt.
-Reuse the **exact same key** on every retry — this is what makes the
-operation safe to retry.
+Generate a stable key tied to the **logical event**, not the request attempt.
+Reuse the exact same key on every retry.
+
+### Anablock CRM — Outreach Sequence Email
 
 ```typescript
 import { Resend } from 'resend';
@@ -17,18 +20,40 @@ import { createHash } from 'crypto';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-async function sendOrderConfirmation(orderId: string, to: string) {
-  // Key is deterministic: same order always produces the same key
+/**
+ * Send a CRM outreach sequence step.
+ * Key is scoped to: contactId + sequenceId + stepNumber
+ * Same contact can be in multiple sequences; same step is never sent twice.
+ */
+async function sendCrmSequenceStep({
+  contactId,
+  sequenceId,
+  stepNumber,
+  to,
+  subject,
+  html,
+}: {
+  contactId: string;
+  sequenceId: string;
+  stepNumber: number;
+  to: string;
+  subject: string;
+  html: string;
+}) {
   const idempotencyKey = createHash('sha256')
-    .update(`order-confirmation:${orderId}`)
+    .update(`crm-sequence:${contactId}:${sequenceId}:step-${stepNumber}`)
     .digest('hex');
 
   const { data, error } = await resend.emails.send(
     {
-      from: 'orders@yourdomain.com',
+      from: 'outreach@anablock.com',
       to,
-      subject: `Order #${orderId} confirmed`,
-      html: `<p>Your order <strong>#${orderId}</strong> is confirmed.</p>`,
+      subject,
+      html,
+      headers: {
+        'List-Unsubscribe': `<https://anablock.com/unsubscribe?contactId=${contactId}>`,
+        'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+      },
     },
     { idempotencyKey }
   );
@@ -38,28 +63,125 @@ async function sendOrderConfirmation(orderId: string, to: string) {
 }
 ```
 
-**Key principle:** Never use `Date.now()`, `Math.random()`, or a UUID
-generated at call time as an idempotency key — these change on every
-attempt and defeat the purpose.
+### Anablock Echo — Appointment Reminder
+
+```typescript
+/**
+ * Send an Echo appointment reminder.
+ * Key is scoped to: appointmentId + reminderType (24h, 1h, etc.)
+ * Prevents duplicate reminders if Echo retries after a transient failure.
+ */
+async function sendEchoAppointmentReminder({
+  appointmentId,
+  reminderType,
+  to,
+  patientName,
+  appointmentTime,
+  practicePhone,
+}: {
+  appointmentId: string;
+  reminderType: '24h' | '1h' | '15min';
+  to: string;
+  patientName: string;
+  appointmentTime: string;
+  practicePhone: string;
+}) {
+  const idempotencyKey = createHash('sha256')
+    .update(`echo-reminder:${appointmentId}:${reminderType}`)
+    .digest('hex');
+
+  const { data, error } = await resend.emails.send(
+    {
+      from: 'reminders@anablock.com',
+      to,
+      subject: `Appointment reminder — ${appointmentTime}`,
+      html: `
+        <p>Hi ${patientName},</p>
+        <p>This is a reminder of your upcoming appointment at <strong>${appointmentTime}</strong>.</p>
+        <p>To reschedule or cancel, call us at ${practicePhone} or reply to this email.</p>
+      `,
+      // Transactional — no List-Unsubscribe header required
+    },
+    { idempotencyKey }
+  );
+
+  if (error) throw error;
+  return data;
+}
+```
+
+### Sterolux — Order Confirmation
+
+```typescript
+/**
+ * Send a Sterolux order confirmation.
+ * Key is scoped to: orderId
+ * Guarantees exactly-once delivery even if the checkout webhook fires twice.
+ */
+async function sendSteroluxOrderConfirmation({
+  orderId,
+  to,
+  customerName,
+  orderTotal,
+  estimatedDelivery,
+}: {
+  orderId: string;
+  to: string;
+  customerName: string;
+  orderTotal: string;
+  estimatedDelivery: string;
+}) {
+  const idempotencyKey = createHash('sha256')
+    .update(`sterolux-order-confirmation:${orderId}`)
+    .digest('hex');
+
+  const { data, error } = await resend.emails.send(
+    {
+      from: 'orders@sterolux.com',
+      to,
+      subject: `Order #${orderId} confirmed — Sterolux`,
+      html: `
+        <p>Hi ${customerName},</p>
+        <p>Thank you for your order. Here are your details:</p>
+        <ul>
+          <li><strong>Order ID:</strong> #${orderId}</li>
+          <li><strong>Total:</strong> ${orderTotal}</li>
+          <li><strong>Estimated delivery:</strong> ${estimatedDelivery}</li>
+        </ul>
+        <p>Questions? Reply to this email or visit <a href="https://sterolux.com/support">sterolux.com/support</a>.</p>
+      `,
+      // Transactional — no List-Unsubscribe header required
+    },
+    { idempotencyKey }
+  );
+
+  if (error) throw error;
+  return data;
+}
+```
 
 ---
 
-## Retry with Exponential Backoff + Jitter
+## 2. Retry with Exponential Backoff + Jitter
+
+Shared utility for all Anablock sending surfaces. Only retry on `429`
+(rate limit) and `5xx` (server error) — never on `4xx` client errors.
 
 ```typescript
 async function sendWithRetry(
   payload: Parameters<typeof resend.emails.send>[0],
+  options?: Parameters<typeof resend.emails.send>[1],
   maxAttempts = 4
 ) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const { data, error } = await resend.emails.send(payload);
+      const { data, error } = await resend.emails.send(payload, options);
       if (error) throw error;
       return data;
     } catch (err: any) {
       const isRetryable =
         err?.statusCode === 429 || // rate limited
-        err?.statusCode >= 500;    // server error
+        err?.statusCode >= 500;    // Resend server error
 
       if (!isRetryable || attempt === maxAttempts) throw err;
 
@@ -70,18 +192,25 @@ async function sendWithRetry(
     }
   }
 }
-```
 
-**Key principle:** Only retry on `429` (rate limit) and `5xx` (server
-error). Never retry `4xx` client errors — a bad request or invalid email
-address will not succeed on retry.
+// Usage — Anablock CRM sequence step with retry
+await sendWithRetry(
+  {
+    from: 'outreach@anablock.com',
+    to: contact.email,
+    subject: 'Following up on your Anablock CRM trial',
+    html: emailHtml,
+  },
+  { idempotencyKey }
+);
+```
 
 ---
 
-## Webhook Signature Verification + Idempotent Processing
+## 3. Webhook Handler — Bounce & Complaint Processing
 
-Always verify Resend's webhook signature before processing. Always
-deduplicate by event ID — webhooks can be delivered more than once.
+Anablock CRM and Echo must suppress bounced and complained addresses
+immediately to protect sender reputation and maintain list hygiene.
 
 ```typescript
 import { Resend } from 'resend';
@@ -94,7 +223,7 @@ export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
-  // Step 1: Verify the webhook signature
+  // Step 1: Verify Resend webhook signature
   let event;
   try {
     event = await resend.webhooks.constructEvent(
@@ -110,7 +239,7 @@ export default async function handler(
     return res.status(400).json({ error: 'Invalid webhook signature' });
   }
 
-  // Step 2: Deduplicate — webhooks can be delivered more than once
+  // Step 2: Deduplicate — Resend may deliver the same event more than once
   const alreadyProcessed = await db.webhookEvents.findUnique({
     where: { id: event.data.email_id },
   });
@@ -120,17 +249,45 @@ export default async function handler(
     data: { id: event.data.email_id, type: event.type },
   });
 
-  // Step 3: Handle the event
+  const recipientEmail = event.data.to[0];
+
   switch (event.type) {
     case 'email.bounced':
-      await suppressEmail(event.data.to[0]);
+      // Hard bounce — suppress in both Anablock CRM and Resend
+      await Promise.all([
+        anablockCrm.contacts.suppress(recipientEmail),   // mark undeliverable in CRM
+        resend.contacts.remove({ email: recipientEmail, audienceId: process.env.RESEND_AUDIENCE_ID! }),
+      ]);
       break;
+
     case 'email.complained':
-      await unsubscribeEmail(event.data.to[0]);
+      // Spam complaint — unsubscribe immediately; 2-day window starts now
+      await Promise.all([
+        anablockCrm.contacts.unsubscribe(recipientEmail),
+        resend.contacts.update({
+          email: recipientEmail,
+          audienceId: process.env.RESEND_AUDIENCE_ID!,
+          unsubscribed: true,
+        }),
+      ]);
       break;
+
     case 'email.delivery_delayed':
-      // Log for monitoring; do not retry manually — Resend retries automatically
-      console.warn('Delivery delayed:', event.data.email_id);
+      // Log for monitoring — Resend retries automatically; do not retry manually
+      console.warn('[Anablock] Delivery delayed:', {
+        emailId: event.data.email_id,
+        to: recipientEmail,
+      });
+      break;
+
+    case 'email.opened':
+    case 'email.clicked':
+      // Update CRM contact engagement score / last contacted date
+      await anablockCrm.contacts.recordEngagement({
+        email: recipientEmail,
+        event: event.type,
+        timestamp: new Date().toISOString(),
+      });
       break;
   }
 
